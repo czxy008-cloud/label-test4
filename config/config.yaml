@@ -1,0 +1,18 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+database:
+  host: "127.0.0.1"
+  port: 5432
+  user: "postgres"
+  password: "postgres"
+  dbname: "clinic"
+  sslmode: "disable"
+  max_open_conns: 50
+  max_idle_conns: 10
+  conn_max_lifetime: 3600
+
+appointment:
+  cancel_before_hours: 24
+  default_quota_per_slot: 10
