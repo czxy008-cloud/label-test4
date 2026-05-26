@@ -197,6 +197,43 @@ func (r *scheduleSlotRepo) GetByDoctorDateTime(ctx context.Context, doctorID int
 	return &slot, nil
 }
 
+func (r *scheduleSlotRepo) ListOverlappingByDoctorAndDate(ctx context.Context, doctorID int64, date, startTime, endTime string, excludeSlotID int64) ([]models.ScheduleSlot, error) {
+	query := `
+		SELECT id, doctor_id, schedule_date, start_time, end_time,
+		       total_quota, used_quota, is_suspended, created_at, updated_at
+		FROM schedule_slots
+		WHERE doctor_id = $1
+		  AND schedule_date = $2
+		  AND start_time < $4
+		  AND end_time > $3
+	`
+	args := []interface{}{doctorID, date, startTime, endTime}
+	if excludeSlotID > 0 {
+		query += ` AND id <> $5`
+		args = append(args, excludeSlotID)
+	}
+	query += ` ORDER BY start_time`
+
+	rows, err := db.GetDB().QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var slots []models.ScheduleSlot
+	for rows.Next() {
+		var slot models.ScheduleSlot
+		if err := rows.Scan(
+			&slot.ID, &slot.DoctorID, &slot.ScheduleDate, &slot.StartTime, &slot.EndTime,
+			&slot.TotalQuota, &slot.UsedQuota, &slot.IsSuspended, &slot.CreatedAt, &slot.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		slots = append(slots, slot)
+	}
+	return slots, rows.Err()
+}
+
 func (r *scheduleSlotRepo) Create(ctx context.Context, slot *models.ScheduleSlot) error {
 	return db.GetDB().QueryRowContext(ctx, `
 		INSERT INTO schedule_slots (doctor_id, schedule_date, start_time, end_time, total_quota, used_quota)

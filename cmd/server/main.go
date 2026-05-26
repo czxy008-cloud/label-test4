@@ -44,13 +44,19 @@ func main() {
 	apptRepo := repository.NewAppointmentRepository()
 	logRepo := repository.NewAppointmentLogRepository()
 	suspensionRepo := repository.NewSuspensionRepository()
+	waitlistRepo := repository.NewWaitlistRepository()
+	notifRepo := repository.NewNotificationRepository()
 
+	notifService := service.NewNotificationService(notifRepo)
 	deptService := service.NewDepartmentService(deptRepo)
 	doctorService := service.NewDoctorService(doctorRepo)
-	scheduleService := service.NewScheduleService(slotRepo, suspensionRepo, doctorRepo, apptRepo, &cfg.Appointment)
-	apptService := service.NewAppointmentService(apptRepo, logRepo, slotRepo, &cfg.Appointment)
+	scheduleService := service.NewScheduleService(slotRepo, suspensionRepo, doctorRepo, apptRepo, waitlistRepo, notifService, &cfg.Appointment)
+	apptService := service.NewAppointmentService(apptRepo, logRepo, slotRepo, waitlistRepo, notifService, &cfg.Appointment)
+	waitlistService := service.NewWaitlistService(waitlistRepo, apptRepo, logRepo, slotRepo, notifService, &cfg.Appointment)
 
-	h := handler.NewHandler(deptService, doctorService, scheduleService, apptService)
+	apptService.SetWaitlistService(waitlistService)
+
+	h := handler.NewHandler(deptService, doctorService, scheduleService, apptService, waitlistService)
 	router := server.SetupRouter(h)
 
 	addr := cfg.Server.Address()

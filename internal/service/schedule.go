@@ -26,11 +26,13 @@ var (
 )
 
 type ScheduleService struct {
-	slotRepo     repository.ScheduleSlotRepository
+	slotRepo       repository.ScheduleSlotRepository
 	suspensionRepo repository.SuspensionRepository
-	doctorRepo   repository.DoctorRepository
-	apptRepo     repository.AppointmentRepository
-	cfg          *config.AppointmentConfig
+	doctorRepo     repository.DoctorRepository
+	apptRepo       repository.AppointmentRepository
+	waitlistRepo   repository.WaitlistRepository
+	notifService   *NotificationService
+	cfg            *config.AppointmentConfig
 }
 
 func NewScheduleService(
@@ -38,6 +40,8 @@ func NewScheduleService(
 	suspensionRepo repository.SuspensionRepository,
 	doctorRepo repository.DoctorRepository,
 	apptRepo repository.AppointmentRepository,
+	waitlistRepo repository.WaitlistRepository,
+	notifService *NotificationService,
 	cfg *config.AppointmentConfig,
 ) *ScheduleService {
 	return &ScheduleService{
@@ -45,6 +49,8 @@ func NewScheduleService(
 		suspensionRepo: suspensionRepo,
 		doctorRepo:     doctorRepo,
 		apptRepo:       apptRepo,
+		waitlistRepo:   waitlistRepo,
+		notifService:   notifService,
 		cfg:            cfg,
 	}
 }
@@ -167,23 +173,23 @@ func (s *ScheduleService) getTemplatesForDay(ctx context.Context, doctorID int64
 	return templates, rows.Err()
 }
 
-func (s *ScheduleService) CreateSuspension(ctx context.Context, doctorID int64, dateStr, reason string) (int, error) {
+func (s *ScheduleService) CreateSuspension(ctx context.Context, doctorID int64, dateStr, reason string) (int, int, error) {
 	_, err := time.Parse("2006-01-02", dateStr)
 	if err != nil {
-		return 0, ErrInvalidDate
+		return 0, 0, ErrInvalidDate
 	}
 
 	exists, err := s.suspensionRepo.Exists(ctx, doctorID, dateStr)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if exists {
-		return 0, ErrSuspensionExists
+		return 0, 0, ErrSuspensionExists
 	}
 
 	tx, err := db.BeginTx(ctx)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer func() {
 		if p := recover(); p != nil {
@@ -199,49 +205,168 @@ func (s *ScheduleService) CreateSuspension(ctx context.Context, doctorID int64, 
 	}
 	if err := s.suspensionRepo.Create(ctx, tx, suspension); err != nil {
 		_ = tx.Rollback()
-		return 0, err
+		return 0, 0, err
 	}
 
 	slots, err := s.slotRepo.ListByDoctorAndDateRange(ctx, doctorID, dateStr, dateStr)
 	if err != nil {
 		_ = tx.Rollback()
-		return 0, err
+		return 0, 0, err
 	}
 
 	totalCancelled := 0
+	totalWaitlistCancelled := 0
 	for _, slot := range slots {
 		slot.IsSuspended = true
-		_, err := db.GetDB().ExecContext(ctx, `
+		_, err := tx.ExecContext(ctx, `
 			UPDATE schedule_slots SET is_suspended = TRUE WHERE id = $1
 		`, slot.ID)
 		if err != nil {
 			_ = tx.Rollback()
-			return 0, err
+			return 0, 0, err
 		}
+
+		appointments, err := s.apptRepo.ListBySlotIDAndStatus(ctx, slot.ID, models.StatusPending)
+		if err != nil {
+			_ = tx.Rollback()
+			return 0, 0, err
+		}
+		confirmedAppts, err := s.apptRepo.ListBySlotIDAndStatus(ctx, slot.ID, models.StatusConfirmed)
+		if err != nil {
+			_ = tx.Rollback()
+			return 0, 0, err
+		}
+		appointments = append(appointments, confirmedAppts...)
 
 		cancelled, err := s.apptRepo.CancelBySlotID(ctx, tx, slot.ID, "doctor", fmt.Sprintf("doctor suspension: %s", reason))
 		if err != nil {
 			_ = tx.Rollback()
-			return 0, err
+			return 0, 0, err
 		}
 		if cancelled > 0 {
 			if err := s.slotRepo.UpdateUsedQuota(ctx, tx, slot.ID, -int(cancelled)); err != nil {
 				_ = tx.Rollback()
-				return 0, err
+				return 0, 0, err
 			}
 		}
+
+		for _, appt := range appointments {
+			appt.Slot = &slot
+			if err := s.notifService.NotifyAppointmentSuspended(ctx, tx, &appt, reason); err != nil {
+				logger.Warn("failed to enqueue suspension notification",
+					zap.Error(err),
+					zap.Int64("appointment_id", appt.ID),
+				)
+			}
+		}
+
+		waitlists, err := s.waitlistRepo.ListBySlotIDAndStatus(ctx, slot.ID, models.WaitlistStatusWaiting)
+		if err != nil {
+			_ = tx.Rollback()
+			return 0, 0, err
+		}
+		for _, wl := range waitlists {
+			if err := s.waitlistRepo.UpdateStatus(ctx, tx, wl.ID, models.WaitlistStatusExpired, nil); err != nil {
+				_ = tx.Rollback()
+				return 0, 0, err
+			}
+			totalWaitlistCancelled++
+		}
+
 		totalCancelled += int(cancelled)
 	}
 
 	if err := tx.Commit(); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	logger.Info("suspension created",
 		zap.Int64("doctor_id", doctorID),
 		zap.String("date", dateStr),
 		zap.Int("cancelled_appointments", totalCancelled),
+		zap.Int("cancelled_waitlist", totalWaitlistCancelled),
 	)
 
-	return totalCancelled, nil
+	return totalCancelled, totalWaitlistCancelled, nil
+}
+
+// CheckScheduleConflict 医生端智能排班冲突检测
+//
+// 校验内容：
+//  1. 同一医生、同一日期、时间段重叠 —— duplicate_slot 冲突
+//  2. 该时段已存在 "进行中"(pending) 或 "已预约"(confirmed) 的有效预约 —— existing_appointment 冲突
+//
+// 参数：
+//   - doctorID 医生 ID
+//   - date 日期 (YYYY-MM-DD)
+//   - startTime 开始时间 (HH:MM)
+//   - endTime 结束时间 (HH:MM)
+//   - excludeSlotID 在修改单日排班时传入，用于排除自身，避免误判；0 表示新排班
+func (s *ScheduleService) CheckScheduleConflict(ctx context.Context, doctorID int64, date, startTime, endTime string, excludeSlotID int64) (*models.ScheduleConflictResponse, error) {
+	conflicts := []models.ScheduleConflict{}
+
+	// 1. 校验时间段是否合法
+	if _, err := time.Parse("2006-01-02", date); err != nil {
+		return nil, ErrInvalidDate
+	}
+	if _, err := time.Parse("15:04", startTime); err != nil {
+		return nil, fmt.Errorf("invalid start_time format, use HH:MM")
+	}
+	if _, err := time.Parse("15:04", endTime); err != nil {
+		return nil, fmt.Errorf("invalid end_time format, use HH:MM")
+	}
+	if startTime >= endTime {
+		return nil, fmt.Errorf("start_time must be earlier than end_time")
+	}
+
+	// 2. 检查同一医生同日的号源时间重叠
+	overlappingSlots, err := s.slotRepo.ListOverlappingByDoctorAndDate(ctx, doctorID, date, startTime, endTime, excludeSlotID)
+	if err != nil {
+		return nil, err
+	}
+	for _, slot := range overlappingSlots {
+		cp := slot
+		conflicts = append(conflicts, models.ScheduleConflict{
+			Type:         models.ConflictTypeDuplicateSlot,
+			Date:         date,
+			StartTime:    slot.StartTime,
+			EndTime:      slot.EndTime,
+			Message:      fmt.Sprintf("%s-%s 已存在排班号源", slot.StartTime, slot.EndTime),
+			ExistingSlot: &cp,
+		})
+	}
+
+	// 3. 检查该时段范围内是否存在 "pending" 或 "confirmed" 的有效预约
+	activeAppts, err := s.apptRepo.ListActiveByDoctorAndDateRange(ctx, doctorID, date, startTime, endTime, excludeSlotID)
+	if err != nil {
+		return nil, err
+	}
+
+	// 按原始时段聚合，返回 "10:00-10:30 已有3个有效预约" 形式
+	type rangeKey struct {
+		start, end string
+	}
+	counts := map[rangeKey]int{}
+	for _, appt := range activeAppts {
+		if appt.Slot == nil {
+			continue
+		}
+		key := rangeKey{start: appt.Slot.StartTime, end: appt.Slot.EndTime}
+		counts[key]++
+	}
+	for key, cnt := range counts {
+		conflicts = append(conflicts, models.ScheduleConflict{
+			Type:      models.ConflictTypeExistingAppt,
+			Date:      date,
+			StartTime: key.start,
+			EndTime:   key.end,
+			Message:   fmt.Sprintf("%s-%s 已有 %d 个有效预约", key.start, key.end, cnt),
+			ApptCount: cnt,
+		})
+	}
+
+	return &models.ScheduleConflictResponse{
+		HasConflict: len(conflicts) > 0,
+		Conflicts:   conflicts,
+	}, nil
 }

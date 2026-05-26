@@ -21,6 +21,7 @@ type Handler struct {
 	doctorService      *service.DoctorService
 	scheduleService    *service.ScheduleService
 	appointmentService *service.AppointmentService
+	waitlistService    *service.WaitlistService
 }
 
 func NewHandler(
@@ -28,12 +29,14 @@ func NewHandler(
 	doctor *service.DoctorService,
 	schedule *service.ScheduleService,
 	appt *service.AppointmentService,
+	wl *service.WaitlistService,
 ) *Handler {
 	return &Handler{
 		deptService:        dept,
 		doctorService:      doctor,
 		scheduleService:    schedule,
 		appointmentService: appt,
+		waitlistService:    wl,
 	}
 }
 
@@ -62,7 +65,8 @@ func (h *Handler) handleError(c *gin.Context, err error) bool {
 	case service.ErrDepartmentNotFound,
 		service.ErrDoctorNotFound,
 		service.ErrSlotNotFound,
-		service.ErrAppointmentNotFound:
+		service.ErrAppointmentNotFound,
+		service.ErrWaitlistNotFound:
 		c.JSON(http.StatusNotFound, dto.Error(404, err.Error()))
 	case service.ErrSlotSuspended,
 		service.ErrSlotNoQuota,
@@ -74,7 +78,11 @@ func (h *Handler) handleError(c *gin.Context, err error) bool {
 		service.ErrCannotCancelPastWindow,
 		service.ErrAlreadyCancelled,
 		service.ErrDuplicateAppointment,
-		service.ErrSlotAlreadyExists:
+		service.ErrSlotAlreadyExists,
+		service.ErrWaitlistNotActive,
+		service.ErrAlreadyInWaitlist,
+		service.ErrSlotNotFull,
+		service.ErrSlotSuspendedWaitlist:
 		c.JSON(http.StatusBadRequest, dto.Error(400, err.Error()))
 	default:
 		c.JSON(http.StatusInternalServerError, dto.Error(500, "internal error: "+err.Error()))
@@ -214,11 +222,14 @@ func (h *Handler) CancelAppointment(c *gin.Context) {
 	if !h.bindAndValidate(c, &req) {
 		return
 	}
-	err = h.appointmentService.CancelAppointment(h.ctx(c), id, req.Reason)
+	promoted, err := h.appointmentService.CancelAppointment(h.ctx(c), id, req.Reason)
 	if h.handleError(c, err) {
 		return
 	}
-	c.JSON(http.StatusOK, dto.Success(nil))
+	c.JSON(http.StatusOK, dto.Success(gin.H{
+		"waitlist_promoted": promoted != nil,
+		"promoted":          promoted,
+	}))
 }
 
 func (h *Handler) ListPatientAppointments(c *gin.Context) {
@@ -290,13 +301,43 @@ func (h *Handler) CreateSuspension(c *gin.Context) {
 	if !h.bindAndValidate(c, &req) {
 		return
 	}
-	cancelled, err := h.scheduleService.CreateSuspension(h.ctx(c), req.DoctorID, req.Date, req.Reason)
+	cancelled, cancelledWaitlist, err := h.scheduleService.CreateSuspension(h.ctx(c), req.DoctorID, req.Date, req.Reason)
 	if h.handleError(c, err) {
 		return
 	}
 	c.JSON(http.StatusOK, dto.Success(gin.H{
 		"cancelled_appointments": cancelled,
+		"cancelled_waitlist":     cancelledWaitlist,
 	}))
+}
+
+// CheckScheduleConflict 医生端智能排班冲突检测
+// 校验同一医生同日时间段重叠，以及是否已有进行中/已预约的有效预约。
+func (h *Handler) CheckScheduleConflict(c *gin.Context) {
+	var req dto.ScheduleConflictCheckRequest
+	if !h.bindAndValidate(c, &req) {
+		return
+	}
+	resp, err := h.scheduleService.CheckScheduleConflict(
+		h.ctx(c),
+		req.DoctorID,
+		req.Date,
+		req.StartTime,
+		req.EndTime,
+		req.ExcludeSlotID,
+	)
+	if h.handleError(c, err) {
+		return
+	}
+	if resp.HasConflict {
+		c.JSON(http.StatusConflict, dto.Response{
+			Code:    409,
+			Message: "schedule conflict detected",
+			Data:    resp,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, dto.Success(resp))
 }
 
 func (h *Handler) GetAppointmentLogs(c *gin.Context) {
@@ -310,4 +351,80 @@ func (h *Handler) GetAppointmentLogs(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, dto.Success(logs))
+}
+
+func (h *Handler) JoinWaitlist(c *gin.Context) {
+	var req dto.WaitlistJoinRequest
+	if !h.bindAndValidate(c, &req) {
+		return
+	}
+	wl, err := h.waitlistService.JoinWaitlist(h.ctx(c), req.SlotID, req.PatientName, req.PatientPhone, req.PatientIDCard)
+	if h.handleError(c, err) {
+		return
+	}
+	c.JSON(http.StatusCreated, dto.Success(wl))
+}
+
+func (h *Handler) GetWaitlist(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, dto.Error(400, "invalid id"))
+		return
+	}
+	wl, err := h.waitlistService.GetWaitlist(h.ctx(c), id)
+	if h.handleError(c, err) {
+		return
+	}
+	c.JSON(http.StatusOK, dto.Success(wl))
+}
+
+func (h *Handler) CancelWaitlist(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, dto.Error(400, "invalid id"))
+		return
+	}
+	var req dto.WaitlistCancelRequest
+	if !h.bindAndValidate(c, &req) {
+		return
+	}
+	err = h.waitlistService.CancelWaitlist(h.ctx(c), id, req.Reason)
+	if h.handleError(c, err) {
+		return
+	}
+	c.JSON(http.StatusOK, dto.Success(nil))
+}
+
+func (h *Handler) ListPatientWaitlists(c *gin.Context) {
+	var req dto.WaitlistListRequest
+	if !h.bindAndValidate(c, &req) {
+		return
+	}
+	waitlists, total, err := h.waitlistService.ListByPatient(
+		h.ctx(c),
+		req.PatientPhone,
+		models.WaitlistStatus(req.Status),
+		req.Page,
+		req.PageSize,
+	)
+	if h.handleError(c, err) {
+		return
+	}
+	c.JSON(http.StatusOK, dto.Paginated(total, req.Page, req.PageSize, waitlists))
+}
+
+func (h *Handler) GetWaitlistCount(c *gin.Context) {
+	slotID, err := strconv.ParseInt(c.Param("slot_id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, dto.Error(400, "invalid slot id"))
+		return
+	}
+	count, err := h.waitlistService.GetWaitlistCount(h.ctx(c), slotID)
+	if h.handleError(c, err) {
+		return
+	}
+	c.JSON(http.StatusOK, dto.Success(gin.H{
+		"slot_id":        slotID,
+		"waitlist_count": count,
+	}))
 }

@@ -13,6 +13,47 @@ const (
 	StatusSuspended AppointmentStatus = "suspended"
 )
 
+type WaitlistStatus string
+
+const (
+	WaitlistStatusWaiting   WaitlistStatus = "waiting"
+	WaitlistStatusPromoted WaitlistStatus = "promoted"
+	WaitlistStatusCancelled WaitlistStatus = "cancelled"
+	WaitlistStatusExpired  WaitlistStatus = "expired"
+)
+
+type NotificationType string
+
+const (
+	NotificationWaitlistPromoted   NotificationType = "waitlist_promoted"
+	NotificationApptCancelled  NotificationType = "appointment_cancelled"
+	NotificationApptConfirmed NotificationType = "appointment_confirmed"
+	NotificationApptSuspended NotificationType = "appointment_suspended"
+)
+
+type ConflictType string
+
+const (
+	ConflictTypeDuplicateSlot ConflictType = "duplicate_slot"
+	ConflictTypeExistingAppt  ConflictType = "existing_appointment"
+)
+
+type ScheduleConflict struct {
+	Type         ConflictType `json:"type"`
+	Date         string       `json:"date"`
+	StartTime    string       `json:"start_time"`
+	EndTime      string       `json:"end_time"`
+	Message      string       `json:"message"`
+	ApptCount    int          `json:"appointment_count,omitempty"`
+	ExistingSlot *ScheduleSlot `json:"existing_slot,omitempty"`
+}
+
+type ScheduleConflictResponse struct {
+	HasConflict bool               `json:"has_conflict"`
+	Conflicts   []ScheduleConflict `json:"conflicts"`
+	Message     string             `json:"message,omitempty"`
+}
+
 type Department struct {
 	ID          int64     `json:"id"`
 	Name        string    `json:"name"`
@@ -87,4 +128,31 @@ type SuspensionDay struct {
 	SuspendDate string    `json:"suspend_date"`
 	Reason      string    `json:"reason,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
+}
+
+type Waitlist struct {
+	ID             int64           `json:"id"`
+	SlotID         int64           `json:"slot_id"`
+	PatientName    string          `json:"patient_name"`
+	PatientPhone   string          `json:"patient_phone"`
+	PatientIDCard  string          `json:"patient_id_card,omitempty"`
+	Status         WaitlistStatus  `json:"status"`
+	Position       int             `json:"position"`
+	AppointmentID  *int64          `json:"appointment_id,omitempty"`
+	Slot           *ScheduleSlot   `json:"slot,omitempty"`
+	Appointment    *Appointment    `json:"appointment,omitempty"`
+	CreatedAt      time.Time       `json:"created_at"`
+	UpdatedAt      time.Time       `json:"updated_at"`
+}
+
+type Notification struct {
+	ID              int64            `json:"id"`
+	Type            NotificationType `json:"type"`
+	RecipientPhone  string           `json:"recipient_phone"`
+	RecipientName   string           `json:"recipient_name"`
+	Content         string           `json:"content"`
+	Metadata        map[string]string `json:"metadata,omitempty"`
+	IsProcessed     bool             `json:"is_processed"`
+	CreatedAt       time.Time        `json:"created_at"`
+	ProcessedAt     *time.Time       `json:"processed_at,omitempty"`
 }

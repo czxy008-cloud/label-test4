@@ -9,6 +9,7 @@ import (
 
 	"clinic-appointment/internal/config"
 	"clinic-appointment/internal/db"
+	"clinic-appointment/internal/dto"
 	"clinic-appointment/internal/logger"
 	"clinic-appointment/internal/models"
 	"clinic-appointment/internal/repository"
@@ -27,24 +28,35 @@ var (
 )
 
 type AppointmentService struct {
-	apptRepo     repository.AppointmentRepository
-	logRepo      repository.AppointmentLogRepository
-	slotRepo     repository.ScheduleSlotRepository
-	cfg          *config.AppointmentConfig
+	apptRepo      repository.AppointmentRepository
+	logRepo       repository.AppointmentLogRepository
+	slotRepo      repository.ScheduleSlotRepository
+	waitlistRepo  repository.WaitlistRepository
+	waitlistService *WaitlistService
+	notifService  *NotificationService
+	cfg           *config.AppointmentConfig
 }
 
 func NewAppointmentService(
 	apptRepo repository.AppointmentRepository,
 	logRepo repository.AppointmentLogRepository,
 	slotRepo repository.ScheduleSlotRepository,
+	waitlistRepo repository.WaitlistRepository,
+	notifService *NotificationService,
 	cfg *config.AppointmentConfig,
 ) *AppointmentService {
 	return &AppointmentService{
-		apptRepo: apptRepo,
-		logRepo:  logRepo,
-		slotRepo: slotRepo,
-		cfg:      cfg,
+		apptRepo:     apptRepo,
+		logRepo:      logRepo,
+		slotRepo:     slotRepo,
+		waitlistRepo: waitlistRepo,
+		notifService: notifService,
+		cfg:          cfg,
 	}
+}
+
+func (s *AppointmentService) SetWaitlistService(wlService *WaitlistService) {
+	s.waitlistService = wlService
 }
 
 func (s *AppointmentService) CreateAppointment(ctx context.Context, slotID int64, patientName, patientPhone, patientIDCard string) (*models.Appointment, error) {
@@ -170,34 +182,34 @@ func (s *AppointmentService) GetAppointmentByNo(ctx context.Context, no string) 
 	return appt, nil
 }
 
-func (s *AppointmentService) CancelAppointment(ctx context.Context, id int64, reason string) error {
+func (s *AppointmentService) CancelAppointment(ctx context.Context, id int64, reason string) (*dto.PromoteResult, error) {
 	appt, err := s.apptRepo.GetByID(ctx, id)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if appt == nil {
-		return ErrAppointmentNotFound
+		return nil, ErrAppointmentNotFound
 	}
 
 	if appt.Status == models.StatusCancelled || appt.Status == models.StatusSuspended {
-		return ErrAlreadyCancelled
+		return nil, ErrAlreadyCancelled
 	}
 
 	slot, err := s.slotRepo.GetByID(ctx, appt.SlotID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if slot == nil {
-		return ErrSlotNotFound
+		return nil, ErrSlotNotFound
 	}
 
 	if err := s.validateCancellationWindow(slot); err != nil {
-		return err
+		return nil, err
 	}
 
 	tx, err := db.BeginTx(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() {
 		if p := recover(); p != nil {
@@ -208,24 +220,41 @@ func (s *AppointmentService) CancelAppointment(ctx context.Context, id int64, re
 
 	if err := s.apptRepo.UpdateStatus(ctx, tx, id, models.StatusCancelled, "patient", reason); err != nil {
 		_ = tx.Rollback()
-		return err
+		return nil, err
 	}
 
 	if err := s.slotRepo.UpdateUsedQuota(ctx, tx, appt.SlotID, -1); err != nil {
 		_ = tx.Rollback()
-		return err
+		return nil, err
+	}
+
+	if err := s.notifService.NotifyAppointmentCancelled(ctx, tx, appt, reason); err != nil {
+		logger.Warn("failed to enqueue cancellation notification, but cancellation succeeded",
+			zap.Error(err),
+			zap.Int64("appointment_id", id),
+		)
+	}
+
+	var promoteResult *dto.PromoteResult
+	if s.waitlistService != nil {
+		promoteResult, err = s.waitlistService.PromoteFromWaitlist(ctx, tx, appt.SlotID)
+		if err != nil {
+			_ = tx.Rollback()
+			return nil, fmt.Errorf("failed to promote from waitlist: %w", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return err
+		return nil, err
 	}
 
 	logger.Info("appointment cancelled",
 		zap.Int64("appointment_id", id),
 		zap.String("reason", reason),
+		zap.Bool("waitlist_promoted", promoteResult != nil),
 	)
 
-	return nil
+	return promoteResult, nil
 }
 
 func (s *AppointmentService) validateCancellationWindow(slot *models.ScheduleSlot) error {

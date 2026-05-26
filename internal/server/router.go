@@ -43,15 +43,25 @@ func SetupRouter(h *handler.Handler) *gin.Engine {
 			appointments.GET("/:id/logs", h.GetAppointmentLogs)
 		}
 
+		waitlist := api.Group("/waitlist")
+		{
+			waitlist.POST("", h.JoinWaitlist)
+			waitlist.GET("/:id", h.GetWaitlist)
+			waitlist.POST("/:id/cancel", h.CancelWaitlist)
+			waitlist.GET("/slot/:slot_id/count", h.GetWaitlistCount)
+		}
+
 		patient := api.Group("/patient")
 		{
 			patient.GET("/appointments", h.ListPatientAppointments)
+			patient.GET("/waitlist", h.ListPatientWaitlists)
 		}
 
 		doctor := api.Group("/doctor")
 		{
 			doctor.GET("/appointments", h.ListDoctorAppointments)
 			doctor.POST("/suspend", h.CreateSuspension)
+			doctor.POST("/schedule/conflict", h.CheckScheduleConflict)
 		}
 	}
 
